@@ -39,6 +39,11 @@ export function DashboardPage() {
       (file.versions.find((version) => version.id === file.activeVersionId)?.pages.length ?? 0),
     0,
   )
+  const pendingBatches = data.batches.filter(
+    (batch) => batch.status === 'pending' || batch.status === 'invalidated',
+  ).length
+  const blockedBatches = data.batches.filter((batch) => batch.status === 'blocked').length
+  const retryBatches = data.outbox.length
 
   const findingColumns: TableColumnsType<ValidationFinding> = [
     {
@@ -134,6 +139,18 @@ export function DashboardPage() {
             showInfo={false}
             size="small"
           />
+        </div>
+        <div className="metric warning">
+          <span>待核/待重算批次</span>
+          <strong>{pendingBatches}</strong>
+          <small>回执晚到、版本不符或文件换版失效</small>
+        </div>
+        <div className="metric danger">
+          <span>阻断/待重试</span>
+          <strong>{blockedBatches + retryBatches}</strong>
+          <small>
+            摘要补不全 {blockedBatches} · 写入失败待整批重试 {retryBatches}
+          </small>
         </div>
       </section>
 

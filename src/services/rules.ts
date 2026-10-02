@@ -4,9 +4,11 @@ import type {
   LicenseRule,
   MaterialFile,
   MaterialPackage,
+  ReconcileBatch,
   ValidationFinding,
   VersionDiff,
 } from '@/types/domain'
+import { pageDigest } from './reconcile'
 
 const levelRank: Record<ApprovalLevel, number> = {
   standard: 1,
@@ -239,6 +241,55 @@ interface PackageDiffSnapshot {
   technologyTags: string[]
   personnelScopes: string[]
   declarations: string[]
+}
+
+/** 对账批次视角：送审固化引用版本 vs 当前引用版本，并标注逐页脱敏摘要漂移 */
+export function diffBatch(
+  batch: ReconcileBatch,
+  files: MaterialFile[],
+): VersionDiff[] {
+  const diff: VersionDiff[] = []
+  batch.frozenFiles.forEach((frozen) => {
+    const file = files.find((item) => item.id === frozen.fileId)
+    const currentVersionId = file?.referencedVersionId
+    if (!file || currentVersionId !== frozen.versionId) {
+      const currentLabel =
+        file?.versions.find((version) => version.id === currentVersionId)?.label ?? '版本已缺失'
+      diff.push({
+        id: `${batch.id}-${frozen.fileId}-ref`,
+        field: `${frozen.name} 引用版本`,
+        before: frozen.versionLabel,
+        after: currentLabel,
+        kind: 'batch',
+        batchId: batch.id,
+      })
+      return
+    }
+    const version = file.versions.find((item) => item.id === frozen.versionId)
+    if (!version) return
+    const driftedPages = frozen.pages
+      .map((frozenPage) => {
+        const currentPage = version.pages.find((page) => page.id === frozenPage.pageId)
+        if (!currentPage) return { page: frozenPage.page, reason: '页面已删除' }
+        const currentDigest = pageDigest(version.hash, currentPage)
+        if (currentDigest !== frozenPage.contentDigest) {
+          return { page: frozenPage.page, reason: currentPage.desensitized ? '脱敏状态/内容已变更' : '脱敏状态/内容已变更' }
+        }
+        return null
+      })
+      .filter((item): item is { page: number; reason: string } => item !== null)
+    if (driftedPages.length) {
+      diff.push({
+        id: `${batch.id}-${frozen.fileId}-pages`,
+        field: `${frozen.name} 逐页脱敏摘要漂移`,
+        before: `送审固化 ${frozen.pages.length} 页摘要`,
+        after: `第 ${driftedPages.map((item) => item.page).join('、')} 页内容与固化摘要不一致`,
+        kind: 'batch',
+        batchId: batch.id,
+      })
+    }
+  })
+  return diff
 }
 
 export const approvalLevelLabels: Record<ApprovalLevel, string> = {

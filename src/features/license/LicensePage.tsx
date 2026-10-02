@@ -12,12 +12,14 @@ import {
   message,
 } from 'antd'
 import type { TableColumnsType } from 'antd'
+import { Link, useSearchParams } from 'react-router-dom'
 import { SafetyCertificateOutlined } from '@ant-design/icons'
-import { useSearchParams } from 'react-router-dom'
 import { PageHeader } from '@/components/PageHeader'
+import { BatchStatusTag } from '@/components/BatchTags'
 import {
   useDeductQuotaMutation,
   useGetWorkspaceQuery,
+  useReleaseBatchMutation,
   useValidatePackageMutation,
 } from '@/app/api'
 import type { LicenseRule } from '@/types/domain'
@@ -28,6 +30,7 @@ export function LicensePage() {
   const { data, isLoading } = useGetWorkspaceQuery()
   const [validatePackage] = useValidatePackageMutation()
   const [deductQuota, deductState] = useDeductQuotaMutation()
+  const [releaseBatch, releaseState] = useReleaseBatchMutation()
   const [selectedId, setSelectedId] = useState(searchParams.get('package') ?? '')
   const [amount, setAmount] = useState(5)
 
@@ -39,11 +42,33 @@ export function LicensePage() {
     () => data?.packages.find((item) => item.id === selectedId),
     [data, selectedId],
   )
+  const openBatch = useMemo(
+    () =>
+      selected
+        ? [...(data?.batches ?? [])]
+            .reverse()
+            .find((batch) => batch.packageId === selected.id && batch.status !== 'released')
+        : undefined,
+    [data, selected],
+  )
+  const latestBatch = useMemo(
+    () =>
+      selected
+        ? [...(data?.batches ?? [])]
+            .reverse()
+            .find((batch) => batch.packageId === selected.id)
+        : undefined,
+    [data, selected],
+  )
   const applicableRule = selected && data ? findApplicableRule(selected, data.rules) : undefined
   const currentRule = data?.rules.find((item) => item.id === selected?.matchedRuleId)
   const packageFindings = data?.findings.filter((item) => item.packageId === selectedId) ?? []
   const hasHighFindings = packageFindings.some((item) => item.level === 'high')
   const remaining = selected ? selected.quotaLimit - selected.quotaUsed : 0
+  const verifiedReceiptTotal =
+    openBatch?.receipts
+      .filter((receipt) => receipt.status === 'verified')
+      .reduce((sum, receipt) => sum + receipt.amount, 0) ?? 0
 
   if (isLoading || !data) return <div className="panel">正在加载许可规则...</div>
 
@@ -83,8 +108,13 @@ export function LicensePage() {
   async function deduct() {
     if (!selected) return
     try {
-      await deductQuota({ packageId: selected.id, amount }).unwrap()
-      message.success(`已扣减 ${amount} 个许可额度`)
+      if (openBatch) {
+        await releaseBatch({ batchId: openBatch.id }).unwrap()
+        message.success('对账批次已放行，已核验回执额度已写入许可记录')
+      } else {
+        await deductQuota({ packageId: selected.id, amount }).unwrap()
+        message.success(`已扣减 ${amount} 个许可额度`)
+      }
     } catch (error) {
       const detail =
         typeof error === 'object' && error && 'data' in error
@@ -210,45 +240,88 @@ export function LicensePage() {
 
         <section className="panel">
           <div className="panel-title">
-            <h3>许可额度扣减</h3>
+            <h3>许可放行与额度</h3>
             <SafetyCertificateOutlined />
           </div>
           {selected ? (
             <Space direction="vertical" size={16} style={{ width: '100%' }}>
+              {openBatch ? (
+                <Alert
+                  type={openBatch.status === 'released' ? 'success' : 'warning'}
+                  showIcon
+                  message={
+                    <Space>
+                      <Link to={`/reconcile?package=${selected.id}`}>
+                        对账批次 {openBatch.code}
+                      </Link>
+                      <BatchStatusTag status={openBatch.status} />
+                    </Space>
+                  }
+                  description={
+                    openBatch.status === 'pending' || openBatch.status === 'invalidated'
+                      ? openBatch.pendingReason
+                      : `放行将按已核验回执合计扣减 ${verifiedReceiptTotal} 额度；重复回执只入一次，版本不符停在待核。`
+                  }
+                />
+              ) : latestBatch ? (
+                <Alert
+                  type="success"
+                  showIcon
+                  message={
+                    <Space>
+                      <span>最近批次 {latestBatch.code} 已放行，许可记录保留</span>
+                      <BatchStatusTag status="released" />
+                    </Space>
+                  }
+                  description="可在回执对账页发起新一轮送审批次。"
+                />
+              ) : null}
               <Progress
                 percent={Math.round((selected.quotaUsed / selected.quotaLimit) * 100)}
                 status={selected.quotaUsed >= selected.quotaLimit ? 'exception' : 'active'}
               />
               <div>
                 已使用 {selected.quotaUsed}，剩余 {remaining}，规则上限 {selected.quotaLimit}
+                {openBatch ? `；本批次已核验回执合计 ${verifiedReceiptTotal}` : ''}
               </div>
-              <InputNumber
-                min={1}
-                max={Math.max(1, remaining)}
-                value={amount}
-                onChange={(value) => setAmount(value ?? 1)}
-                addonAfter="额度单位"
-                style={{ width: '100%' }}
-              />
+              {!openBatch ? (
+                <InputNumber
+                  min={1}
+                  max={Math.max(1, remaining)}
+                  value={amount}
+                  onChange={(value) => setAmount(value ?? 1)}
+                  addonAfter="额度单位"
+                  style={{ width: '100%' }}
+                />
+              ) : null}
               <Button
                 type="primary"
                 block
                 disabled={
-                  selected.status !== 'approved' ||
-                  hasHighFindings ||
-                  amount > remaining ||
-                  remaining <= 0
+                  openBatch
+                    ? openBatch.status === 'released'
+                    : selected.status !== 'approved' ||
+                      hasHighFindings ||
+                      amount > remaining ||
+                      remaining <= 0
                 }
-                loading={deductState.isLoading}
+                loading={releaseState.isLoading || deductState.isLoading}
                 onClick={deduct}
               >
-                确认扣减并完成许可
+                {openBatch ? '对账通过并放行批次' : '确认扣减并完成许可'}
               </Button>
-              {selected.status !== 'approved' ? (
+              {openBatch && openBatch.status !== 'released' ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="批次放行需：审批全部确认、回执全部核验且版本一致、逐页脱敏摘要完整。"
+                />
+              ) : null}
+              {!openBatch && selected.status !== 'approved' ? (
                 <Alert type="warning" showIcon message="只有全部审批步骤完成后才允许扣减额度。" />
               ) : null}
               {hasHighFindings ? (
-                <Alert type="error" showIcon message="存在高风险核对项，系统拒绝扣减额度。" />
+                <Alert type="error" showIcon message="存在高风险核对项，系统拒绝放行或扣减额度。" />
               ) : null}
             </Space>
           ) : null}

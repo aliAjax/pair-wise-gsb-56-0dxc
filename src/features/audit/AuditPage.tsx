@@ -78,23 +78,71 @@ export function AuditPage() {
     const payload = {
       exportedAt: new Date().toISOString(),
       policySet: '2026 出口管制规则集',
-      packages: workspace.packages.map((item) => ({
-        code: item.code,
-        title: item.title,
-        destination: item.destination,
-        status: item.status,
-        round: item.currentRound,
-        rule: workspace.rules.find((rule) => rule.id === item.matchedRuleId)?.name,
-        files: workspace.files
-          .filter((file) => file.packageId === item.id)
-          .map((file) => ({
-            name: file.name,
-            activeVersion: file.versions.find((version) => version.id === file.activeVersionId)?.label,
-            referencedVersion: file.versions.find(
-              (version) => version.id === file.referencedVersionId,
-            )?.label,
+      packages: workspace.packages.map((item) => {
+        const packageBatches = workspace.batches.filter((batch) => batch.packageId === item.id)
+        return {
+          code: item.code,
+          title: item.title,
+          destination: item.destination,
+          status: item.status,
+          round: item.currentRound,
+          rule: workspace.rules.find((rule) => rule.id === item.matchedRuleId)?.name,
+          files: workspace.files
+            .filter((file) => file.packageId === item.id)
+            .map((file) => ({
+              name: file.name,
+              activeVersion: file.versions.find((version) => version.id === file.activeVersionId)?.label,
+              referencedVersion: file.versions.find(
+                (version) => version.id === file.referencedVersionId,
+              )?.label,
+            })),
+          // 审批、版本差异、导出展示同一对账批次
+          reconcileBatches: packageBatches.map((batch) => ({
+            code: batch.code,
+            round: batch.round,
+            status: batch.status,
+            revision: batch.revision,
+            packageVersion: batch.packageVersionLabel,
+            legacyBackfilled: batch.legacyBackfilled ?? false,
+            frozenFiles: batch.frozenFiles.map((frozen) => ({
+              name: frozen.name,
+              version: frozen.versionLabel,
+              versionHash: frozen.versionHash,
+              digestComplete: frozen.digestComplete,
+              pages: frozen.pages.map((page) => ({
+                page: page.page,
+                controlled: page.controlled,
+                desensitized: page.desensitized,
+                contentDigest: page.contentDigest,
+                digestComplete: page.digestComplete,
+                backfilled: page.backfilled ?? false,
+              })),
+            })),
+            approvalRoute: batch.route.map((step) => ({
+              role: step.role,
+              assignee: step.assignee,
+              status: step.status,
+              comment: step.comment,
+              decidedRound: step.decidedRound ?? null,
+              invalidatedReason: step.invalidatedReason ?? null,
+            })),
+            receipts: batch.receipts.map((receipt) => ({
+              receiptNo: receipt.receiptNo,
+              platform: receipt.platform,
+              amount: receipt.amount,
+              status: receipt.status,
+              duplicateCount: receipt.duplicateCount,
+              packageVersionId: receipt.packageVersionId ?? null,
+              fileRefs: receipt.fileRefs,
+              verifiedAt: receipt.verifiedAt ?? null,
+            })),
+            events: batch.events,
+            releasedAt: batch.releasedAt ?? null,
+            quotaUsedAfter: batch.quotaUsedAfter ?? null,
           })),
-      })),
+        }
+      }),
+      outboxPendingRetry: workspace.outbox,
       findings: workspace.findings,
       audit: workspace.audit,
     }
@@ -103,7 +151,7 @@ export function AuditPage() {
         action: '导出追溯包',
         target: '全量审批追溯 JSON',
         operator: '当前用户',
-        detail: `导出 ${workspace.packages.length} 个资料包与 ${workspace.audit.length} 条审计记录。`,
+        detail: `导出 ${workspace.packages.length} 个资料包、${workspace.batches.length} 个对账批次与 ${workspace.audit.length} 条审计记录。`,
       },
     }).unwrap()
     downloadFile(
