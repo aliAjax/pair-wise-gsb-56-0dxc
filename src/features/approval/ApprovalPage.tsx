@@ -12,7 +12,7 @@ import {
   message,
 } from 'antd'
 import type { TableColumnsType } from 'antd'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { PageHeader } from '@/components/PageHeader'
 import { StatusTag } from '@/components/StatusTag'
 import {
@@ -20,8 +20,9 @@ import {
   useGetWorkspaceQuery,
   useSubmitApprovalMutation,
 } from '@/app/api'
-import type { ApprovalStep, MaterialPackage } from '@/types/domain'
+import type { ApprovalStep, MaterialPackage, ReconciliationBatch } from '@/types/domain'
 import { approvalLevelLabels } from '@/services/rules'
+import { batchStatusColor, batchStatusLabels, liveRoute } from '@/services/reconciliation'
 
 export function ApprovalPage() {
   const [searchParams] = useSearchParams()
@@ -202,6 +203,91 @@ export function ApprovalPage() {
           pagination={false}
           rowClassName={(record) => (record.id === selectedId ? 'ant-table-row-selected' : '')}
           onRow={(record) => ({ onClick: () => setSelectedId(record.id) })}
+        />
+      </section>
+
+      <section className="panel">
+        <div className="panel-title">
+          <h3>对账批次审批路线（送审固化版本）</h3>
+          <Link to="/reconciliation">进入回执对账批次 →</Link>
+        </div>
+        <Table
+          rowKey="id"
+          size="small"
+          pagination={false}
+          dataSource={workspace.batches.filter(
+            (batch) => batch.status !== 'blocked' && batch.status !== 'released',
+          )}
+          columns={[
+            {
+              title: '批次',
+              dataIndex: 'batchNo',
+              width: 160,
+              render: (value: string, batch: ReconciliationBatch) => (
+                <Space direction="vertical" size={0}>
+                  <strong className="mono">{value}</strong>
+                  <span className="muted">
+                    {workspace.packages.find((pkg) => pkg.id === batch.packageId)?.code} · rev {batch.rev}
+                  </span>
+                </Space>
+              ),
+            },
+            {
+              title: '固化版本 / 指纹',
+              render: (_, batch) => (
+                <span className="muted">
+                  {batch.packageVersionLabel} · <span className="mono">{batch.fingerprint}</span>
+                </span>
+              ),
+            },
+            {
+              title: '路线进度',
+              width: 260,
+              render: (_, batch) => {
+                const route = liveRoute(batch)
+                return (
+                  <Space size={4} wrap>
+                    {route.map((step) => (
+                      <Tag
+                        key={step.id}
+                        color={
+                          step.status === 'approved'
+                            ? 'success'
+                            : step.status === 'active'
+                              ? 'processing'
+                              : step.status === 'returned'
+                                ? 'error'
+                                : 'default'
+                        }
+                      >
+                        {step.role}
+                      </Tag>
+                    ))}
+                    {batch.route.some((step) => step.status === 'invalidated') ? (
+                      <Tag>含换版失效重算节点</Tag>
+                    ) : null}
+                  </Space>
+                )
+              },
+            },
+            {
+              title: '状态',
+              dataIndex: 'status',
+              width: 140,
+              render: (value: ReconciliationBatch['status']) => (
+                <Tag color={batchStatusColor(value)}>{batchStatusLabels[value]}</Tag>
+              ),
+            },
+            {
+              title: '操作',
+              width: 110,
+              render: (_, batch) => (
+                <Link to="/reconciliation" state={{ batchId: batch.id }}>
+                  处理批次
+                </Link>
+              ),
+            },
+          ]}
         />
       </section>
 

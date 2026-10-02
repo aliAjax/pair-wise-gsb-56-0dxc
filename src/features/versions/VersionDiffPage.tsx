@@ -7,8 +7,9 @@ import {
   useGetWorkspaceQuery,
   useSetReferenceVersionMutation,
 } from '@/app/api'
-import type { MaterialFile, VersionDiff } from '@/types/domain'
+import type { MaterialFile, ReconciliationBatch, VersionDiff } from '@/types/domain'
 import { diffPackageVersions } from '@/services/rules'
+import { batchStatusColor, batchStatusLabels } from '@/services/reconciliation'
 
 export function VersionDiffPage() {
   const [searchParams] = useSearchParams()
@@ -33,9 +34,56 @@ export function VersionDiffPage() {
     }
   }, [selected, versionId])
 
+  // 批次视角：同一批次固化的文件引用版本与现行版本差异
+  const packageBatches = useMemo(
+    () => (data && selectedId ? data.batches.filter((batch) => batch.packageId === selectedId) : []),
+    [data, selectedId],
+  )
+  const [batchId, setBatchId] = useState<string | undefined>(undefined)
+  useEffect(() => {
+    if (!packageBatches.some((batch) => batch.id === batchId)) {
+      setBatchId(packageBatches[0]?.id)
+    }
+  }, [packageBatches, batchId])
+
   if (isLoading || !data) return <div className="panel">正在加载版本数据...</div>
 
   const diffs = selected ? diffPackageVersions(selected, versionId, files) : []
+
+  const selectedBatch: ReconciliationBatch | undefined = packageBatches.find(
+    (batch) => batch.id === batchId,
+  )
+
+  const batchFileColumns: TableColumnsType<ReconciliationBatch['files'][number]> = [
+    { title: '文件', dataIndex: 'fileName' },
+    {
+      title: '批次固化引用',
+      width: 150,
+      render: (_, ref) => (
+        <Tag color="blue">
+          {ref.versionLabel} · {ref.versionHash}
+        </Tag>
+      ),
+    },
+    {
+      title: '现行版本',
+      width: 150,
+      render: (_, ref) => {
+        const file = files.find((item) => item.id === ref.fileId)
+        const current = file?.versions.find((version) => version.id === file?.activeVersionId)
+        const changed = current?.id !== ref.versionId
+        return (
+          <Tag color={changed ? 'error' : 'success'}>
+            {current?.label ?? '版本已删除'} {changed ? '· 已换版' : '· 一致'}
+          </Tag>
+        )
+      },
+    },
+    {
+      title: '逐页摘要',
+      render: (_, ref) => `${ref.digests.length} 页 · 指纹 ${ref.digests[0]?.hash ?? '—'}`,
+    },
+  ]
 
   const fileColumns: TableColumnsType<MaterialFile> = [
     { title: '文件名称', dataIndex: 'name', minWidth: 230 },
@@ -192,6 +240,53 @@ export function VersionDiffPage() {
             message="全部文件版本引用一致。"
             style={{ marginTop: 14 }}
           />
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="panel-title">
+          <h3>批次固化引用 vs 现行版本</h3>
+          <Space>
+            <Select
+              size="small"
+              style={{ width: 220 }}
+              value={batchId}
+              onChange={setBatchId}
+              options={packageBatches.map((batch) => ({
+                value: batch.id,
+                label: `${batch.batchNo} · ${batch.packageVersionLabel}`,
+              }))}
+            />
+            {selectedBatch ? <Tag color={batchStatusColor(selectedBatch.status)}>{batchStatusLabels[selectedBatch.status]}</Tag> : null}
+          </Space>
+        </div>
+        {selectedBatch ? (
+          <>
+            <Descriptions size="small" column={3} style={{ marginBottom: 12 }}>
+              <Descriptions.Item label="批次">
+                <span className="mono">{selectedBatch.fingerprint}</span> 指纹
+              </Descriptions.Item>
+              <Descriptions.Item label="固化资料包版本">{selectedBatch.packageVersionLabel}</Descriptions.Item>
+              <Descriptions.Item label="固化时间">
+                {new Date(selectedBatch.frozenAt).toLocaleString('zh-CN')}
+              </Descriptions.Item>
+            </Descriptions>
+            <Table
+              rowKey="fileId"
+              size="small"
+              columns={batchFileColumns}
+              dataSource={selectedBatch.files}
+              pagination={false}
+            />
+            <Alert
+              style={{ marginTop: 12 }}
+              type="info"
+              showIcon
+              message="批次内的审批、回执核对与导出始终按固化引用对账；现行版本换版只触发受影响节点重算，不改写固化摘要。"
+            />
+          </>
+        ) : (
+          <Alert type="info" showIcon message="该资料包暂无对账批次，送审后在此查看固化引用差异。" />
         )}
       </section>
     </div>

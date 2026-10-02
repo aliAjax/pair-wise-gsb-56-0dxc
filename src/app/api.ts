@@ -4,11 +4,22 @@ import type {
   MaterialFile,
   MaterialPackage,
   PageReview,
+  PendingAction,
+  ReconciliationBatch,
   ReviewComment,
   WorkspaceState,
 } from '@/types/domain'
-import { loadWorkspace, resetWorkspace, saveWorkspace } from '@/services/storage'
+import {
+  loadOutbox,
+  loadWorkspace,
+  resetWorkspace,
+  saveOutbox,
+  saveWorkspace,
+  setWriteFault,
+} from '@/services/storage'
+import { now } from '@/services/reconciliation'
 import { createApprovalRoute, findApplicableRule, validatePackage } from '@/services/rules'
+import { handleBatchMutation, restoreFromSnapshot } from '@/services/batchActions'
 
 type MockRequest = {
   url: string
@@ -16,17 +27,24 @@ type MockRequest = {
   body?: unknown
 }
 
-type MockError = { status: number; error: string }
+type MockError = {
+  status: number
+  error: string
+  conflict?: boolean
+  reasons?: string[]
+  data?: { writeFailed?: boolean; batchId?: string }
+}
 
 const wait = (ms = 180) => new Promise((resolve) => window.setTimeout(resolve, ms))
-const now = () => new Date().toISOString()
 
-const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
+export const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
   url,
   body,
 }) => {
   await wait()
   let state = loadWorkspace()
+  // 动作执行前的深拷贝：写失败时据此生成"动作前完整批次快照"
+  const beforeState: WorkspaceState = JSON.parse(JSON.stringify(state))
   const payload = (body ?? {}) as Record<string, unknown>
   const audit = (entry: Omit<WorkspaceState['audit'][number], 'id' | 'createdAt'>) => {
     state.audit.unshift({ ...entry, id: `audit-${crypto.randomUUID()}`, createdAt: now() })
@@ -268,6 +286,48 @@ const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
         operator: '当前用户',
         detail: `扣减 ${amount}，剩余 ${packageItem.quotaLimit - packageItem.quotaUsed}。`,
       })
+    } else if (url.startsWith('/batch/') && url !== '/batch/retry') {
+      const result = handleBatchMutation(url, payload, state, audit)
+      if (!result.ok) {
+        throw Object.assign(new Error(result.error), {
+          conflict: result.conflict,
+          reasons: result.reasons,
+        })
+      }
+    } else if (url === '/batch/retry') {
+      const actionId = String(payload.actionId)
+      const actor = String(payload.actor ?? '当前用户')
+      const outbox = loadOutbox()
+      const pending = outbox.find((item) => item.id === actionId)
+      if (!pending) throw new Error('待重试动作不存在或已办结')
+      const batch = restoreFromSnapshot(state, pending)
+      const replay = handleBatchMutation(
+        pending.action,
+        { ...pending.payload, actor },
+        state,
+        audit,
+      )
+      if (!replay.ok) throw new Error(replay.error)
+      const nextOutbox = outbox.filter((item) => item.id !== actionId)
+      saveOutbox(nextOutbox)
+      state.pendingActions = nextOutbox
+      audit({
+        packageId: batch.packageId,
+        action: '失败动作重试成功',
+        target: batch.batchNo,
+        operator: actor,
+        detail: `从动作前完整批次快照重放「${pending.action}」，此前失败 ${pending.attempts} 次。`,
+      })
+    } else if (url === '/fault/toggle') {
+      setWriteFault(Boolean(payload.on))
+      audit({
+        action: payload.on ? '开启写入故障注入' : '关闭写入故障注入',
+        target: '本地存储通道',
+        operator: '当前用户',
+        detail: payload.on
+          ? '后续写入将失败并转入待重试（outbox）。'
+          : '写入通道恢复，可从完整批次重试。',
+      })
     } else if (url === '/comment/add') {
       state.comments.unshift({
         ...(payload.comment as Omit<ReviewComment, 'id' | 'createdAt'>),
@@ -283,16 +343,94 @@ const mockBaseQuery: BaseQueryFn<MockRequest, unknown, MockError> = async ({
       throw new Error(`未实现的本地接口：${url}`)
     }
 
-    saveWorkspace(state)
-    return { data: state }
+    try {
+      saveWorkspace(state)
+      // 写入成功后清理 outbox：批次已推进（rev 超过快照或已放行）的待办作废
+      const outbox = loadOutbox()
+      if (outbox.length) {
+        const kept = outbox.filter((item) => {
+          const batch = state.batches.find((b) => b.id === item.batchId)
+          if (!batch) return true
+          if (batch.status === 'released') return false
+          // 快照动作已体现在更新的批次中（rev 已超过快照）则作废
+          return batch.rev <= item.fullBatchSnapshot.rev
+        })
+        if (kept.length !== outbox.length) {
+          saveOutbox(kept)
+          state.pendingActions = kept
+          persistAgain(state)
+        } else {
+          state.pendingActions = outbox
+        }
+      }
+      return { data: state }
+    } catch (writeError) {
+      // 写入失败：把动作与动作前的完整批次快照转入 outbox（重试时按原 payload 重放）
+      const outbox = loadOutbox()
+      const canEnqueue = url.startsWith('/batch/') && url !== '/batch/retry'
+      const payloadBatchId = String(
+        payload.batchId ??
+          payload.packageId ??
+          (payload.fullBatchSnapshot as { batchId?: string } | undefined)?.batchId ??
+          '',
+      )
+      // 动作后被修改的批次 = 与动作前内容不同者；优先使用请求指定的批次
+      const changedBatches = state.batches
+        .map((after, index) => ({
+          after,
+          before: beforeState.batches.find((item) => item.id === after.id) ?? beforeState.batches[index],
+        }))
+        .filter(({ after, before }) => before && JSON.stringify(before) !== JSON.stringify(after))
+      const target =
+        changedBatches.find((item) => item.after.id === payloadBatchId) ?? changedBatches[0]
+      if (target && canEnqueue) {
+        const preAction: ReconciliationBatch = {
+          ...target.before,
+          status: 'write_failed',
+          note: writeError instanceof Error ? writeError.message : '写入失败',
+        }
+        const previous = outbox.find((item) => item.batchId === target.after.id)
+        const pending: PendingAction = {
+          id: previous?.id ?? `pending-${crypto.randomUUID()}`,
+          batchId: target.after.id,
+          action: url,
+          actor: String(payload.actor ?? '当前用户'),
+          payload: payload as Record<string, unknown>,
+          fullBatchSnapshot: preAction,
+          createdAt: previous?.createdAt ?? now(),
+          attempts: (previous?.attempts ?? 0) + 1,
+          lastError: writeError instanceof Error ? writeError.message : '写入失败',
+        }
+        const deduped = [pending, ...outbox.filter((item) => item.batchId !== target.after.id)]
+        saveOutbox(deduped)
+        state.pendingActions = deduped
+      }
+      // 内存中的主库变更不落盘即丢弃；outbox 已独立持久化，可从完整批次重试
+      return {
+        error: {
+          status: 503,
+          error:
+            writeError instanceof Error
+              ? `${writeError.message}（可从完整批次重试）`
+              : '写入失败，可从完整批次重试',
+          data: { writeFailed: canEnqueue, batchId: target?.after.id },
+        },
+      }
+    }
   } catch (error) {
     return {
       error: {
         status: 400,
         error: error instanceof Error ? error.message : '本地操作失败',
-      },
+        conflict: Boolean((error as { conflict?: boolean }).conflict),
+        reasons: (error as { reasons?: string[] }).reasons,
+      } as MockError,
     }
   }
+}
+
+function persistAgain(state: WorkspaceState) {
+  window.localStorage.setItem('export-control-review-v2', JSON.stringify(state))
 }
 
 export const workspaceApi = createApi({
@@ -392,6 +530,61 @@ export const workspaceApi = createApi({
       query: () => ({ url: '/workspace/reset', method: 'POST' }),
       invalidatesTags: ['Workspace'],
     }),
+    freezeBatch: builder.mutation<
+      WorkspaceState,
+      { packageId: string; actor?: string }
+    >({
+      query: (body) => ({ url: '/batch/freeze', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    decideBatch: builder.mutation<
+      WorkspaceState,
+      { batchId: string; stepId: string; passed: boolean; comment: string; actor?: string }
+    >({
+      query: (body) => ({ url: '/batch/decide', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    ingestInbox: builder.mutation<WorkspaceState, { actor?: string }>({
+      query: (body) => ({ url: '/batch/ingest', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    checkReceipt: builder.mutation<
+      WorkspaceState,
+      { batchId: string; receiptId: string; resolution: 'confirm' | 'reject'; actor?: string }
+    >({
+      query: (body) => ({ url: '/batch/receipt/check', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    changeFileVersion: builder.mutation<
+      WorkspaceState,
+      { packageId: string; fileId: string; label: string; summary: string; actor?: string }
+    >({
+      query: (body) => ({ url: '/batch/file-version', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    backfillBatch: builder.mutation<WorkspaceState, { batchId: string; actor?: string }>({
+      query: (body) => ({ url: '/batch/backfill', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    releaseBatch: builder.mutation<
+      WorkspaceState,
+      { batchId: string; expectedRev: number; actor?: string }
+    >({
+      query: (body) => ({ url: '/batch/release', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    releaseRace: builder.mutation<WorkspaceState, { batchId: string; actor: string }>({
+      query: (body) => ({ url: '/batch/release-race', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    retryPending: builder.mutation<WorkspaceState, { actionId: string; actor?: string }>({
+      query: (body) => ({ url: '/batch/retry', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
+    toggleFault: builder.mutation<WorkspaceState, { on: boolean }>({
+      query: (body) => ({ url: '/fault/toggle', method: 'POST', body }),
+      invalidatesTags: ['Workspace'],
+    }),
   }),
 })
 
@@ -411,4 +604,14 @@ export const {
   useAddCommentMutation,
   useAddAuditMutation,
   useResetWorkspaceMutation,
+  useFreezeBatchMutation,
+  useDecideBatchMutation,
+  useIngestInboxMutation,
+  useCheckReceiptMutation,
+  useChangeFileVersionMutation,
+  useBackfillBatchMutation,
+  useReleaseBatchMutation,
+  useReleaseRaceMutation,
+  useRetryPendingMutation,
+  useToggleFaultMutation,
 } = workspaceApi

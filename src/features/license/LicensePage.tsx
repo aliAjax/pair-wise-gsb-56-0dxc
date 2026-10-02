@@ -262,6 +262,56 @@ export function LicensePage() {
         </div>
         <Table rowKey="id" columns={ruleColumns} dataSource={data.rules} pagination={false} />
       </section>
+
+      <section className="panel">
+        <div className="panel-title">
+          <h3>批次放行生成的许可记录</h3>
+          <Space>
+            <Tag color="success">{data.licenses.length} 条有效许可</Tag>
+            <Tag>{data.pendingActions.length} 条写入待续办</Tag>
+          </Space>
+        </div>
+        <Table
+          rowKey="id"
+          size="small"
+          pagination={false}
+          dataSource={data.licenses}
+          columns={[
+            { title: '许可编号', dataIndex: 'id', width: 160, render: (v: string) => <span className="mono">{v}</span> },
+            { title: '对账批次', dataIndex: 'batchNo', width: 160, render: (v: string) => <span className="mono">{v}</span> },
+            { title: '资料包', render: (_, record) => `${record.code} · ${record.title}` },
+            { title: '目的地', dataIndex: 'destination', width: 100 },
+            {
+              title: '回执单号',
+              dataIndex: 'receiptNos',
+              render: (values: string[]) => values.join('、'),
+            },
+            {
+              title: '放行时间 / 操作人',
+              width: 210,
+              render: (_, record) => (
+                <span>
+                  {new Date(record.releasedAt).toLocaleString('zh-CN')} · {record.releasedBy}
+                </span>
+              ),
+            },
+            {
+              title: '换版后',
+              dataIndex: 'retained',
+              width: 110,
+              render: (retained: boolean) =>
+                retained ? <Tag color="success">许可保留</Tag> : <Tag>已撤销</Tag>,
+            },
+          ]}
+          locale={{ emptyText: '尚无批次放行产生的许可记录' }}
+        />
+        <Alert
+          style={{ marginTop: 12 }}
+          type="info"
+          showIcon
+          message="许可记录在文件换版后永久保留；只有批次审批全部通过、回执版本逐张与固化引用一致、摘要齐全时才会生成。"
+        />
+      </section>
     </div>
   )
 }

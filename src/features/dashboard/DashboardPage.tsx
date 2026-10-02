@@ -1,4 +1,4 @@
-import { Alert, Button, Progress, Space, Table, Tag } from 'antd'
+import { Alert, Button, Space, Table, Tag } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { useNavigate } from 'react-router-dom'
 import { PageHeader } from '@/components/PageHeader'
@@ -13,7 +13,6 @@ export function DashboardPage() {
 
   if (isLoading || !data) return <div className="panel">正在加载本地工作区...</div>
 
-  const highFindings = data.findings.filter((item) => item.level === 'high')
   const activePackages = data.packages.filter((item) =>
     ['validating', 'reviewing', 'returned'].includes(item.status),
   )
@@ -25,20 +24,11 @@ export function DashboardPage() {
       ).length ?? 0),
     0,
   )
-  const reviewedPages = data.files.reduce(
-    (total, file) =>
-      total +
-      (file.versions.find((version) => version.id === file.activeVersionId)?.pages.filter(
-        (page) => page.reviewedAt,
-      ).length ?? 0),
-    0,
-  )
-  const totalPages = data.files.reduce(
-    (total, file) =>
-      total +
-      (file.versions.find((version) => version.id === file.activeVersionId)?.pages.length ?? 0),
-    0,
-  )
+  const pendingReceipts = data.inbox.filter((mail) => !mail.ingested).length
+  const pendingCheckBatches = data.batches.filter(
+    (batch) => batch.status === 'pending_check' || batch.status === 'blocked' || batch.status === 'write_failed',
+  ).length
+  const releasedBatches = data.batches.filter((batch) => batch.status === 'released').length
 
   const findingColumns: TableColumnsType<ValidationFinding> = [
     {
@@ -110,39 +100,38 @@ export function DashboardPage() {
 
       <section className="metric-grid">
         <div className="metric danger">
-          <span>高风险核对项</span>
-          <strong>{highFindings.length}</strong>
-          <small>必须解决后才能批准或扣减额度</small>
+          <span>待核/阻断/失败批次</span>
+          <strong>{pendingCheckBatches}</strong>
+          <small>回执错版停待核、摘要补不全或写入待重试</small>
         </div>
         <div className="metric info">
-          <span>处理中资料包</span>
-          <strong>{activePackages.length}</strong>
-          <small>审批中、已退回或校验中</small>
+          <span>平台未入账回执</span>
+          <strong>{pendingReceipts}</strong>
+          <small>晚到、重复件在对账批次中只入一次</small>
+        </div>
+        <div className="metric">
+          <span>已放行批次</span>
+          <strong>{releasedBatches}</strong>
+          <small>许可记录已保留，文件换版不影响许可</small>
         </div>
         <div className="metric warning">
           <span>受控技术页</span>
           <strong>{controlledPages}</strong>
           <small>当前版本已标记受控的页面</small>
         </div>
-        <div className="metric">
-          <span>逐页核对进度</span>
-          <strong>
-            {reviewedPages} / {totalPages}
-          </strong>
-          <Progress
-            percent={totalPages ? Math.round((reviewedPages / totalPages) * 100) : 0}
-            showInfo={false}
-            size="small"
-          />
-        </div>
       </section>
 
-      {highFindings.length ? (
+      {pendingReceipts > 0 || pendingCheckBatches > 0 ? (
         <Alert
           showIcon
-          type="error"
-          message={`当前有 ${highFindings.length} 项高风险核对结论，系统不会在资料不完整时静默批准。`}
+          type="warning"
+          message={`${pendingReceipts} 张平台回执待入账，${pendingCheckBatches} 个批次停在待核/阻断/失败，需在回执对账批次中续办。`}
           style={{ marginBottom: 16 }}
+          action={
+            <Button size="small" type="primary" onClick={() => navigate('/reconciliation')}>
+              进入对账批次
+            </Button>
+          }
         />
       ) : null}
 

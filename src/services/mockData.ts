@@ -1,12 +1,21 @@
 import type {
   FileVersion,
+  LicenseRecord,
   LicenseRule,
   MaterialFile,
   MaterialPackage,
   PageReview,
+  PlatformReceipt,
+  ReconciliationBatch,
   WorkspaceState,
 } from '@/types/domain'
-import { createApprovalRoute, validatePackage } from './rules'
+import { createApprovalRoute, findApplicableRule, validatePackage } from './rules'
+import {
+  buildBatchRoute,
+  buildFileRef,
+  fingerprintOf,
+  fnv1a,
+} from './reconciliation'
 
 function pages(
   count: number,
@@ -18,8 +27,8 @@ function pages(
     page: index + 1,
     category: 'technical',
     controlled: false,
-    desensitized: false,
-    note: '',
+    desensitized: reviewed,
+    note: reviewed ? `第 ${index + 1} 页技术内容已逐页核对并脱敏` : '',
     reviewer: reviewed ? '王合规' : '',
     reviewedAt: reviewed ? '2026-09-27T04:00:00.000Z' : undefined,
     ...overrides,
@@ -109,13 +118,16 @@ const rules: LicenseRule[] = [
 ]
 
 const v1 = version('V1.0', 8, true, 'A41C-90D2', '初始工艺规程')
-const v2 = version('V1.1', 9, false, 'D9F2-114A', '新增铺层顺序与固化曲线', {
+const v2 = version('V1.1', 9, true, 'D9F2-114A', '新增铺层顺序与固化曲线', {
   controlled: true,
 })
 const sw1 = version('V2.0', 5, true, '7EA2-319F', '标准控制器软件包')
 const sw2 = version('V2.1', 6, true, '52CC-8D10', '修复通信模块并更新校验文件')
 const us1 = version('V3.2', 12, false, 'E11A-77B4', '光刻设备参数说明', { controlled: true })
-const my1 = version('V1.0', 4, false, '88AB-3411', '厂房布置示意')
+const us2 = version('V3.3', 10, true, 'B72C-09D8', '修订运动轴精度参数并补齐脱敏页', {
+  controlled: true,
+})
+const my1 = version('V1.0', 4, true, '88AB-3411', '厂房布置示意')
 
 export function createInitialState(): WorkspaceState {
   const now = '2026-09-28T06:00:00.000Z'
@@ -231,7 +243,7 @@ export function createInitialState(): WorkspaceState {
       name: '铺层工艺规程.pdf',
       kind: 'technical',
       activeVersionId: v2.id,
-      referencedVersionId: v1.id,
+      referencedVersionId: v2.id,
       versions: [v1, v2],
     },
     {
@@ -257,9 +269,9 @@ export function createInitialState(): WorkspaceState {
       packageId: 'pkg-003',
       name: '光刻平台运动控制说明.pdf',
       kind: 'technical',
-      activeVersionId: us1.id,
+      activeVersionId: us2.id,
       referencedVersionId: us1.id,
-      versions: [us1],
+      versions: [us1, us2],
     },
     {
       id: 'file-004-a',
@@ -325,11 +337,18 @@ export function createInitialState(): WorkspaceState {
   const findings = packages.flatMap((packageItem) =>
     validatePackage(packageItem, files, rules),
   )
+
+  const { batches, inbox, licenses } = buildBatchSeeds(packages, files, rules)
+
   return {
     packages,
     files,
     rules,
     findings,
+    batches,
+    inbox,
+    pendingActions: [],
+    licenses,
     comments: [
       {
         id: 'comment-1',
@@ -378,6 +397,245 @@ export function createInitialState(): WorkspaceState {
       },
     ],
   }
+}
+
+/**
+ * 对账批次种子：
+ * - B2026-0927-02（pkg-002）审批全部通过、回执齐全，已放行（许可记录保留）；
+ * - B2026-0928-01（pkg-001）审批中，部分步骤已确认；
+ * - B2026-0928-02（pkg-004）旧数据缺逐页摘要，引用旧版本已不可得 → 待回填/阻断；
+ * 收件箱含晚到重复件、错版件与尚未入账的新件。
+ */
+function buildBatchSeeds(
+  packages: MaterialPackage[],
+  files: MaterialFile[],
+  rules: LicenseRule[],
+) {
+  const levelFor = (packageItem: MaterialPackage) =>
+    findApplicableRule(packageItem, rules)?.approvalLevel ?? 'standard'
+
+  const makeBatch = (
+    id: string,
+    batchNo: string,
+    packageId: string,
+    options: {
+      frozenAt: string
+      approvals: number // 已通过节点数
+      status: ReconciliationBatch['status']
+      omitDigests?: boolean
+      unresolvable?: boolean
+    },
+  ): ReconciliationBatch | null => {
+    const packageItem = packages.find((item) => item.id === packageId)
+    if (!packageItem) return null
+    const packageFiles = files.filter((file) => file.packageId === packageId)
+    const refs = packageFiles
+      .map((file) => buildFileRef(file))
+      .filter((ref): ref is Exclude<typeof ref, { error: string }> => 'fileId' in ref)
+    if (!refs.length) return null
+
+    const level = levelFor(packageItem)
+    const levels = Object.fromEntries(packageFiles.map((file) => [file.id, level]))
+    const route = buildBatchRoute(refs, levels)
+    route.forEach((step, index) => {
+      if (index < options.approvals) {
+        step.status = 'approved'
+        step.comment = `${step.role}确认：版本与脱敏摘要核对无误。`
+        step.decidedAt = options.frozenAt
+        step.decidedBy = step.assignee
+        step.history.push({
+          by: step.assignee,
+          passed: true,
+          comment: step.comment,
+          at: options.frozenAt,
+        })
+      }
+    })
+    if (options.approvals < route.length && route[options.approvals]) {
+      route[options.approvals].status = 'active'
+    }
+
+    let batchRefs = refs
+    if (options.omitDigests) {
+      batchRefs = refs.map((ref) => ({ ...ref, digests: [] }))
+    }
+    if (options.unresolvable) {
+      // 模拟引用的旧版本在现行版本链中已删除
+      batchRefs = refs.map((ref, index) =>
+        index === 0
+          ? {
+              ...ref,
+              versionId: `version-purged-${crypto.randomUUID().slice(0, 8)}`,
+              versionLabel: `${ref.versionLabel}-已回收`,
+              digests: [
+                {
+                  pageId: 'legacy-missing',
+                  page: 1,
+                  category: ref.digests[0]?.category ?? 'drawing',
+                  controlled: false,
+                  hash: fnv1a(`legacy:${ref.fileId}`),
+                  redactedSummary: '旧批次缺少逐页摘要，等待按首次送审内容回填',
+                  state: 'unresolvable' as const,
+                },
+              ],
+            }
+          : { ...ref, digests: [] },
+      )
+    }
+
+    const pkgVersion = packageItem.versions.at(-1)
+    return {
+      id,
+      batchNo,
+      packageId,
+      packageVersionId: pkgVersion?.id ?? `pkgv-${crypto.randomUUID()}`,
+      packageVersionLabel: pkgVersion?.label ?? 'V1.0',
+      fingerprint: fingerprintOf(packageItem, batchRefs, pkgVersion?.id ?? 'legacy'),
+      status: options.status,
+      files: batchRefs,
+      route,
+      receipts: [],
+      attempts: [],
+      rev: 1,
+      frozenAt: options.frozenAt,
+      frozenBy: packageItem.applicant,
+      blockReasons: options.unresolvable ? ['旧批次逐页摘要缺失，等待回填'] : [],
+      backfilled: false,
+    }
+  }
+
+  const batchReleased = makeBatch('batch-002', 'B2026-0927-02', 'pkg-002', {
+    frozenAt: '2026-09-27T02:40:00.000Z',
+    approvals: 2,
+    status: 'released',
+  })
+  const batchApproval = makeBatch('batch-001', 'B2026-0928-01', 'pkg-001', {
+    frozenAt: '2026-09-28T06:10:00.000Z',
+    approvals: 1,
+    status: 'in_approval',
+  })
+  const batchLegacy = makeBatch('batch-003', 'B2026-0925-09', 'pkg-004', {
+    frozenAt: '2026-09-25T03:00:00.000Z',
+    approvals: 0,
+    status: 'blocked',
+    omitDigests: true,
+    unresolvable: true,
+  })
+
+  const batches = [batchApproval, batchReleased, batchLegacy].filter(
+    (item): item is ReconciliationBatch => Boolean(item),
+  )
+
+  // ---- 回执 ----
+  const receiptNow = '2026-09-28T07:00:00.000Z'
+  if (batchReleased) {
+    batchReleased.releasedAt = '2026-09-27T08:30:00.000Z'
+    batchReleased.releasedBy = '许可管理员'
+    batchReleased.rev = 6
+    batchReleased.files.forEach((ref) => {
+      batchReleased.receipts.push({
+        id: `receipt-${crypto.randomUUID()}`,
+        receiptNo: `LP-RCP-${ref.fileId.slice(-3)}-9001`,
+        fileId: ref.fileId,
+        fileName: ref.fileName,
+        claimedVersionId: ref.versionId,
+        claimedVersionLabel: ref.versionLabel,
+        issuedAt: '2026-09-27T07:50:00.000Z',
+        receivedAt: '2026-09-27T08:10:00.000Z',
+        state: 'verified',
+        checkedBy: '许可管理员',
+        checkedAt: '2026-09-27T08:20:00.000Z',
+        note: '回执版本与批次固化引用一致，自动核对通过',
+      })
+    })
+  }
+
+  if (batchApproval) {
+    // 第一张文件回执先到（审批未完，先入账挂起）；另来一张重复件
+    const ref = batchApproval.files[0]
+    if (ref) {
+      batchApproval.receipts.push({
+        id: 'receipt-seed-001',
+        receiptNo: 'LP-RCP-001-1001',
+        fileId: ref.fileId,
+        fileName: ref.fileName,
+        claimedVersionId: ref.versionId,
+        claimedVersionLabel: ref.versionLabel,
+        issuedAt: '2026-09-28T06:40:00.000Z',
+        receivedAt: receiptNow,
+        state: 'verified',
+        checkedBy: '许可管理员',
+        checkedAt: receiptNow,
+        note: '回执版本与批次固化引用一致，自动核对通过',
+      })
+    }
+  }
+
+  // ---- 平台收件箱：已入账 / 重复晚到 / 错版 / 未取 ----
+  const inbox: PlatformReceipt[] = [
+    {
+      id: 'mail-1',
+      receiptNo: 'LP-RCP-001-1001',
+      packageId: 'pkg-001',
+      fileId: batchApproval?.files[0]?.fileId ?? 'file-001-a',
+      claimedVersionId: batchApproval?.files[0]?.versionId ?? 'v1',
+      issuedAt: '2026-09-28T06:40:00.000Z',
+      ingested: true,
+      result: 'verified',
+      batchId: batchApproval?.id,
+    },
+    {
+      // 平台晚到的重复回执（同一单号）
+      id: 'mail-2',
+      receiptNo: 'LP-RCP-001-1001',
+      packageId: 'pkg-001',
+      fileId: batchApproval?.files[0]?.fileId ?? 'file-001-a',
+      claimedVersionId: batchApproval?.files[0]?.versionId ?? 'v1',
+      issuedAt: '2026-09-28T09:20:00.000Z',
+      ingested: false,
+    },
+    {
+      // 第二张文件的错版回执：仍声称 V1.0（批次已固化现行版本）
+      id: 'mail-3',
+      receiptNo: 'LP-RCP-001-1002',
+      packageId: 'pkg-001',
+      fileId: 'file-001-b',
+      claimedVersionId: 'version-stale-9999',
+      issuedAt: '2026-09-28T09:40:00.000Z',
+      ingested: false,
+    },
+    {
+      // pkg-002 新一批晚到件（批次已放行，不再入新账，仅留痕重复）
+      id: 'mail-4',
+      receiptNo: 'LP-RCP-002-2001',
+      packageId: 'pkg-002',
+      fileId: 'file-002-a',
+      claimedVersionId: batchReleased?.files[0]?.versionId ?? 'sw2',
+      issuedAt: '2026-09-28T10:00:00.000Z',
+      ingested: false,
+    },
+  ]
+
+  const licenses: LicenseRecord[] = batchReleased
+    ? [
+        {
+          id: 'license-001',
+          batchId: batchReleased.id,
+          batchNo: batchReleased.batchNo,
+          packageId: 'pkg-002',
+          code: 'EC-2026-002',
+          title: '工业控制器基础软件包',
+          destination: '德国',
+          receiptNos: batchReleased.receipts.map((receipt) => receipt.receiptNo),
+          releasedAt: batchReleased.releasedAt!,
+          releasedBy: '许可管理员',
+          fingerprint: batchReleased.fingerprint,
+          retained: true,
+        },
+      ]
+    : []
+
+  return { batches, inbox, licenses }
 }
 
 export const categoryLabels = {

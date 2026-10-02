@@ -6,6 +6,7 @@ import {
   FileTextOutlined,
   SafetyCertificateOutlined,
   SolutionOutlined,
+  SwapOutlined,
 } from '@ant-design/icons'
 import { Avatar, Layout, Menu, Tag, Typography } from 'antd'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
@@ -18,6 +19,7 @@ const menuItems = [
   { key: '/packages', icon: <FileTextOutlined />, label: '资料包' },
   { key: '/page-review', icon: <FileSearchOutlined />, label: '逐页核对' },
   { key: '/approvals', icon: <SolutionOutlined />, label: '审批路线' },
+  { key: '/reconciliation', icon: <SwapOutlined />, label: '回执对账批次' },
   { key: '/licenses', icon: <SafetyCertificateOutlined />, label: '许可与额度' },
   { key: '/versions', icon: <DiffOutlined />, label: '版本差异' },
   { key: '/audit', icon: <AuditOutlined />, label: '审计与导出' },
